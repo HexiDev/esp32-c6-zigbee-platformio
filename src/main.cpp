@@ -1,115 +1,79 @@
-#ifndef ZIGBEE_MODE_ZCZR
-#error "Zigbee end device mode is not selected in Tools->Zigbee mode"
-#endif
-
 #include "Zigbee.h"
-#include <Arduino.h>
 
 #define LED_PIN RGB_BUILTIN
 #define BUTTON_PIN 9 // ESP32-C6/H2 Boot button
 #define ZIGBEE_LIGHT_ENDPOINT 10
-#define RGB_TRANSITION_TIME 500
+#define SWITCH_ENDPOINT_NUMBER 5
+
+#define GPIO_INPUT_IO_TOGGLE_SWITCH 9
+#define PAIR_SIZE(TYPE_STR_PAIR) (sizeof(TYPE_STR_PAIR) / sizeof(TYPE_STR_PAIR[0]))
 
 ZigbeeLight zbLight = ZigbeeLight(ZIGBEE_LIGHT_ENDPOINT);
-int identifyTime = 0;
-
-// Define an RGB structure for managing colors
-struct RGB
+ZigbeeSwitch zbSwitch = ZigbeeSwitch(SWITCH_ENDPOINT_NUMBER);
+typedef enum
 {
-	int r;
-	int g;
-	int b;
-};
-RGB currentRGB = {0, 0, 0}; // Current LED color
-RGB targetRGB = {0, 0, 0};	// Target LED color
+	SWITCH_ON_CONTROL,
+	SWITCH_OFF_CONTROL,
+	SWITCH_ONOFF_TOGGLE_CONTROL,
+	SWITCH_LEVEL_UP_CONTROL,
+	SWITCH_LEVEL_DOWN_CONTROL,
+	SWITCH_LEVEL_CYCLE_CONTROL,
+	SWITCH_COLOR_CONTROL,
+} SwitchFunction;
 
-/********************* RGB LED Fade Task **************************/
-void ledHandler(void *pvParameters)
+typedef struct
 {
-	while (true)
+	uint8_t pin;
+	SwitchFunction func;
+} SwitchData;
+
+typedef enum
+{
+	SWITCH_IDLE,
+	SWITCH_PRESS_ARMED,
+	SWITCH_PRESS_DETECTED,
+	SWITCH_PRESSED,
+	SWITCH_RELEASE_DETECTED,
+} SwitchState;
+
+static SwitchData buttonFunctionPair[] = {{GPIO_INPUT_IO_TOGGLE_SWITCH, SWITCH_ONOFF_TOGGLE_CONTROL}};
+
+/********************* Zigbee functions **************************/
+static void onZbButton(SwitchData *button_func_pair)
+{
+	if (button_func_pair->func == SWITCH_ONOFF_TOGGLE_CONTROL)
 	{
-		// Gradually fade the LED from currentRGB to targetRGB
-		if (currentRGB.r != targetRGB.r || currentRGB.g != targetRGB.g || currentRGB.b != targetRGB.b)
+		// Send toggle command to the light
+		zbSwitch.lightToggle();
+	}
+}
+
+/********************* GPIO functions **************************/
+static QueueHandle_t gpio_evt_queue = NULL;
+
+static void IRAM_ATTR onGpioInterrupt(void *arg)
+{
+	xQueueSendFromISR(gpio_evt_queue, (SwitchData *)arg, NULL);
+}
+
+static void enableGpioInterrupt(bool enabled)
+{
+	for (int i = 0; i < PAIR_SIZE(buttonFunctionPair); ++i)
+	{
+		if (enabled)
 		{
-			// Fade Red component
-			if (currentRGB.r < targetRGB.r)
-				currentRGB.r++;
-			else if (currentRGB.r > targetRGB.r)
-				currentRGB.r--;
-
-			// Fade Green component
-			if (currentRGB.g < targetRGB.g)
-				currentRGB.g++;
-			else if (currentRGB.g > targetRGB.g)
-				currentRGB.g--;
-
-			// Fade Blue component
-			if (currentRGB.b < targetRGB.b)
-				currentRGB.b++;
-			else if (currentRGB.b > targetRGB.b)
-				currentRGB.b--;
-
-			// Update the LED
-			rgbLedWrite(8, currentRGB.r, currentRGB.g, currentRGB.b);
-
-			// Wait for transition time
-			vTaskDelay(RGB_TRANSITION_TIME / 255 / portTICK_PERIOD_MS);
+			enableInterrupt((buttonFunctionPair[i]).pin);
 		}
 		else
 		{
-			// No change, just idle
-			vTaskDelay(100 / portTICK_PERIOD_MS);
+			disableInterrupt((buttonFunctionPair[i]).pin);
 		}
 	}
-
-	vTaskDelete(NULL);
 }
-
-/********************* Identify Blinking Task **************************/
-void identifyTask(void *pvParameters)
-{
-	RGB storedRGB;
-	while (true)
-	{
-		int time = *(int *)pvParameters;
-		if (time == 0)
-			storedRGB = targetRGB;
-		while (time > 0)
-		{
-			for (int i = 0; i < 2; i++)
-			{
-				targetRGB = {255, 0, 0}; // White color
-				vTaskDelay(500 / 2 / portTICK_PERIOD_MS);
-				targetRGB = {0, 0, 0}; // Turn off
-				vTaskDelay(500 / 2 / portTICK_PERIOD_MS);
-			}
-			time -= 1;
-		}
-		targetRGB = storedRGB;
-		vTaskDelay(1000 / portTICK_PERIOD_MS);
-	}
-
-	vTaskDelete(NULL);
-}
-
-/********************* Set LED State **************************/
-void setLED(bool value)
-{
-	log_i("Setting LED to %d", value);
-	targetRGB = value ? RGB{255, 255, 255} : RGB{0, 0, 0}; // Fade to white or off
-}
-
-/********************* Identify Callback **************************/
-void identify(uint16_t timeRemaining)
-{
-	log_i("Identify called with time %d", timeRemaining);
-	identifyTime = timeRemaining;
-}
-
-/********************* Arduino Functions **************************/
+/********************* Arduino functions **************************/
 void setup()
 {
-	// Init LED and turn it OFF
+	// Init LED and turn it OFF (if LED_PIN == RGB_BUILTIN, the rgbLedWrite() will be used under the hood)
 	pinMode(LED_PIN, OUTPUT);
 	digitalWrite(LED_PIN, LOW);
 
@@ -117,45 +81,96 @@ void setup()
 	pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 	// Optional: set Zigbee device name and model
-	zbLight.setManufacturerAndModel("Espressif", "ZBLightBulb");
+	zbSwitch.setManufacturerAndModel("Espressif", "ZBSwitchBulb");
 
-	// Set callback function for light change
-	zbLight.onLightChange(setLED);
-	zbLight.onIdentify(identify);
+	// Optional to allow multiple light to bind to the switch
+	zbSwitch.allowMultipleBinding(true);
 
 	// Add endpoint to Zigbee Core
 	log_d("Adding ZigbeeLight endpoint to Zigbee Core");
-	Zigbee.addEndpoint(&zbLight);
+	Zigbee.addEndpoint(&zbSwitch);
 
-	// When all EPs are registered, start Zigbee
+	for (int i = 0; i < PAIR_SIZE(buttonFunctionPair); i++)
+	{
+		pinMode(buttonFunctionPair[i].pin, INPUT_PULLUP);
+		/* create a queue to handle gpio event from isr */
+		gpio_evt_queue = xQueueCreate(10, sizeof(SwitchData));
+		if (gpio_evt_queue == 0)
+		{
+			log_e("Queue was not created and must not be used");
+			while (1)
+				;
+		}
+		attachInterruptArg(buttonFunctionPair[i].pin, onGpioInterrupt, (void *)(buttonFunctionPair + i), FALLING);
+	}
+
+	Zigbee.setRebootOpenNetwork(180);
+
+	// When all EPs are registered, start Zigbee. By default acts as ZIGBEE_END_DEVICE
 	log_d("Calling Zigbee.begin()");
-	Zigbee.begin(ZIGBEE_ROUTER);
+	Zigbee.begin(ZIGBEE_END_DEVICE);
 
-	// Create task for LED fade handler
-	xTaskCreate(ledHandler, "ledHandler", 2048, NULL, 1, NULL);
-
-	// Create task for identify blinking
-	xTaskCreate(identifyTask, "identifyTask", 2048, &identifyTime, 1, NULL);
+	Serial.println("Waiting for Light to bound to the switch");
+	// Wait for switch to bound to a light:
+	while (!zbSwitch.bound())
+	{
+		Serial.printf(".");
+		delay(500);
+	}
 }
 
 void loop()
 {
-	// Checking button for factory reset
-	if (digitalRead(BUTTON_PIN) == LOW)
+	// Handle button switch in loop()
+	uint8_t pin = 0;
+	SwitchData buttonSwitch;
+	static SwitchState buttonState = SWITCH_IDLE;
+	bool eventFlag = false;
+
+	/* check if there is any queue received, if yes read out the buttonSwitch */
+	if (xQueueReceive(gpio_evt_queue, &buttonSwitch, portMAX_DELAY))
 	{
-		// Key debounce handling
-		delay(100);
-		int startTime = millis();
-		while (digitalRead(BUTTON_PIN) == LOW)
-		{
-			delay(50);
-			if ((millis() - startTime) > 3000)
-			{
-				// If key pressed for more than 3secs, factory reset Zigbee and reboot
-				Serial.printf("Resetting Zigbee to factory settings, reboot.\n");
-				Zigbee.factoryReset();
-			}
-		}
+		pin = buttonSwitch.pin;
+		enableGpioInterrupt(false);
+		eventFlag = true;
 	}
-	delay(100);
+	while (eventFlag)
+	{
+		bool value = digitalRead(pin);
+		switch (buttonState)
+		{
+		case SWITCH_IDLE:
+			buttonState = (value == LOW) ? SWITCH_PRESS_DETECTED : SWITCH_IDLE;
+			break;
+		case SWITCH_PRESS_DETECTED:
+			buttonState = SWITCH_PRESSED;
+			(*onZbButton)(&buttonSwitch);
+			break;
+		case SWITCH_PRESSED:
+			buttonState = (value == LOW) ? SWITCH_PRESSED : SWITCH_RELEASE_DETECTED;
+			break;
+		case SWITCH_RELEASE_DETECTED:
+			buttonState = SWITCH_IDLE;
+			(*onZbButton)(&buttonSwitch);
+			/* callback to button_handler */
+			break;
+		default:
+			break;
+		}
+		if (buttonState == SWITCH_IDLE)
+		{
+			enableGpioInterrupt(true);
+			eventFlag = false;
+			break;
+		}
+		vTaskDelay(10 / portTICK_PERIOD_MS);
+	}
+
+	// print the bound lights every 10 seconds
+	static uint32_t lastPrint = 0;
+	if (millis() - lastPrint > 10000)
+	{
+		lastPrint = millis();
+		zbSwitch.printBoundDevices();
+	}
 }
