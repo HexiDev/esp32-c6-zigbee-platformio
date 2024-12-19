@@ -2,14 +2,23 @@
 
 #define LED_PIN RGB_BUILTIN
 #define BUTTON_PIN 9 // ESP32-C6/H2 Boot button
-#define ZIGBEE_LIGHT_ENDPOINT 10
+
+#define LIGHT_ENDPOINT_NUMBER 10
 #define SWITCH_ENDPOINT_NUMBER 5
+#define THERMOSTAT_ENDPOINT_NUMBER 6
+#define TEMP_SENSOR_ENDPOINT_NUMBER 11
 
 #define GPIO_INPUT_IO_TOGGLE_SWITCH 9
 #define PAIR_SIZE(TYPE_STR_PAIR) (sizeof(TYPE_STR_PAIR) / sizeof(TYPE_STR_PAIR[0]))
 
-ZigbeeLight zbLight = ZigbeeLight(ZIGBEE_LIGHT_ENDPOINT);
-ZigbeeSwitch zbSwitch = ZigbeeSwitch(SWITCH_ENDPOINT_NUMBER);
+ZigbeeThermostat zbThermostat = ZigbeeThermostat(THERMOSTAT_ENDPOINT_NUMBER);
+
+// Save temperature sensor data
+float sensor_temp;
+float sensor_max_temp;
+float sensor_min_temp;
+float sensor_tolerance;
+
 typedef enum
 {
 	SWITCH_ON_CONTROL,
@@ -39,15 +48,14 @@ typedef enum
 static SwitchData buttonFunctionPair[] = {{GPIO_INPUT_IO_TOGGLE_SWITCH, SWITCH_ONOFF_TOGGLE_CONTROL}};
 
 /********************* Zigbee functions **************************/
-static void onZbButton(SwitchData *button_func_pair)
-{
-	if (button_func_pair->func == SWITCH_ONOFF_TOGGLE_CONTROL)
-	{
-		// Send toggle command to the light
-		zbSwitch.lightToggle();
-	}
-}
 
+void recieveSensorConfig(float min_temp, float max_temp, float tolerance)
+{
+	Serial.printf("Temperature sensor settings: min %.2f°C, max %.2f°C, tolerance %.2f°C\n", min_temp, max_temp, tolerance);
+	sensor_min_temp = min_temp;
+	sensor_max_temp = max_temp;
+	sensor_tolerance = tolerance;
+}
 /********************* GPIO functions **************************/
 static QueueHandle_t gpio_evt_queue = NULL;
 
@@ -81,14 +89,10 @@ void setup()
 	pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 	// Optional: set Zigbee device name and model
-	zbSwitch.setManufacturerAndModel("Espressif", "ZBSwitchBulb");
-
-	// Optional to allow multiple light to bind to the switch
-	zbSwitch.allowMultipleBinding(true);
-
+	zbThermostat.setManufacturerAndModel("Espressif", "Thermostat");
+	zbThermostat.allowMultipleBinding(true);
 	// Add endpoint to Zigbee Core
-	log_d("Adding ZigbeeLight endpoint to Zigbee Core");
-	Zigbee.addEndpoint(&zbSwitch);
+	Zigbee.addEndpoint(&zbThermostat);
 
 	for (int i = 0; i < PAIR_SIZE(buttonFunctionPair); i++)
 	{
@@ -110,67 +114,38 @@ void setup()
 	log_d("Calling Zigbee.begin()");
 	Zigbee.begin(ZIGBEE_END_DEVICE);
 
-	Serial.println("Waiting for Light to bound to the switch");
+	Serial.println("Waiting for Sensor to bound to the thermostat");
 	// Wait for switch to bound to a light:
-	while (!zbSwitch.bound())
-	{
-		Serial.printf(".");
-		delay(500);
-	}
+	// while (!zbThermostat.bound())
+	// {
+	// 	Serial.printf(".");
+	// 	delay(500);
+	// }
+
+	// Get temperature sensor configuration
 }
 
 void loop()
 {
-	// Handle button switch in loop()
-	uint8_t pin = 0;
-	SwitchData buttonSwitch;
-	static SwitchState buttonState = SWITCH_IDLE;
-	bool eventFlag = false;
-
-	/* check if there is any queue received, if yes read out the buttonSwitch */
-	if (xQueueReceive(gpio_evt_queue, &buttonSwitch, portMAX_DELAY))
-	{
-		pin = buttonSwitch.pin;
-		enableGpioInterrupt(false);
-		eventFlag = true;
-	}
-	while (eventFlag)
-	{
-		bool value = digitalRead(pin);
-		switch (buttonState)
+	if (digitalRead(BUTTON_PIN) == LOW)
+	{ // Push button pressed
+		// Key debounce handling
+		delay(100);
+		int startTime = millis();
+		while (digitalRead(BUTTON_PIN) == LOW)
 		{
-		case SWITCH_IDLE:
-			buttonState = (value == LOW) ? SWITCH_PRESS_DETECTED : SWITCH_IDLE;
-			break;
-		case SWITCH_PRESS_DETECTED:
-			buttonState = SWITCH_PRESSED;
-			(*onZbButton)(&buttonSwitch);
-			break;
-		case SWITCH_PRESSED:
-			buttonState = (value == LOW) ? SWITCH_PRESSED : SWITCH_RELEASE_DETECTED;
-			break;
-		case SWITCH_RELEASE_DETECTED:
-			buttonState = SWITCH_IDLE;
-			(*onZbButton)(&buttonSwitch);
-			/* callback to button_handler */
-			break;
-		default:
-			break;
+			delay(50);
+			if ((millis() - startTime) > 3000)
+			{
+				// If key pressed for more than 3secs, factory reset Zigbee and reboot
+				Serial.println("Resetting Zigbee to factory and rebooting in 1s.");
+				delay(1000);
+				Zigbee.factoryReset();
+			}
 		}
-		if (buttonState == SWITCH_IDLE)
-		{
-			enableGpioInterrupt(true);
-			eventFlag = false;
-			break;
-		}
-		vTaskDelay(10 / portTICK_PERIOD_MS);
-	}
+		zbThermostat.getSensorSettings();
 
-	// print the bound lights every 10 seconds
-	static uint32_t lastPrint = 0;
-	if (millis() - lastPrint > 10000)
-	{
-		lastPrint = millis();
-		zbSwitch.printBoundDevices();
+		zbThermostat.printBoundDevices();
 	}
+	delay(100);
 }
